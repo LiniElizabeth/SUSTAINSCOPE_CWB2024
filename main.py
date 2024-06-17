@@ -1,203 +1,334 @@
 import streamlit as st
-import openai
-from langchain_openai import OpenAI
-from langchain_openai import OpenAIEmbeddings
-from langchain_community.vectorstores.azuresearch import AzureSearch
+import seaborn as sns
+import os
+from textblob import TextBlob
 from azure.search.documents import SearchClient
 from azure.core.credentials import AzureKeyCredential
 import matplotlib.pyplot as plt
 from wordcloud import WordCloud
 import pandas as pd
 from dotenv import load_dotenv
-import os
+
+from langchain_openai import OpenAI,ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
+from langchain.output_parsers import ResponseSchema, StructuredOutputParser,CommaSeparatedListOutputParser
+from langchain_core.prompts import PromptTemplate, ChatPromptTemplate
+from azure.search.documents.indexes import SearchIndexClient
+from azure.search.documents.models import VectorizedQuery
+from langchain_community.vectorstores.azuresearch import AzureSearch
+from DataRetrievalModules import read_summaries_from_file,generate_insights,write_summaries_to_file,retrieve_docs_similarity
 from langchain.chains.question_answering import load_qa_chain
-from langchain.prompts import PromptTemplate
-from langchain_community.retrievers import AzureAISearchRetriever
-import seaborn as sns
-
-
 
 #Loading Environment Variables
 load_dotenv()
 
 #Obtaining Azure AI Search Credentials 
-AZURE_AI_SEARCH_SERVICE_NAME=os.getenv("AZURE_AI_SEARCH_SERVICE_NAME")
 AZURE_AI_SEARCH_ENDPOINT=os.getenv("AZURE_AI_SEARCH_ENDPOINT")
 AZURE_AI_SEARCH_API_KEY=os.getenv("AZURE_AI_SEARCH_API_KEY")  
 AZURE_AI_SEARCH_INDEX_NAME=os.getenv("AZURE_AI_SEARCH_INDEX_NAME")
-search_client = SearchClient(endpoint=AZURE_AI_SEARCH_ENDPOINT, index_name=AZURE_AI_SEARCH_INDEX_NAME, credential=AzureKeyCredential("AZURE_AI_SEARCH_API_KEY"))
+#search_client = SearchClient(endpoint=AZURE_AI_SEARCH_ENDPOINT, index_name=AZURE_AI_SEARCH_INDEX_NAME, credential=AzureKeyCredential(AZURE_AI_SEARCH_API_KEY))
 
 #Obtaining OpenAI Credentials 
 OPENAI_API_KEY=os.getenv("OPENAI_API_KEY")
 
 #Initialise OpenAI Model
-llm = OpenAI(temperature=0.9, max_tokens=500, model = "gpt-3.5-turbo-instruct")
+llm = OpenAI(temperature=0, max_tokens=500, model = "gpt-4o")
+model=ChatOpenAI(temperature=0, max_tokens=500, model = "gpt-4o")
+model_chat=ChatOpenAI(temperature=0.2, max_tokens=500, model = "gpt-4o")
 #Initialise OpenAI Embeddings Model
 embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
 
-#Initialising the Azure AI Search retriever
-retriever = AzureAISearchRetriever(content_key="content", top_k=1, index_name=AZURE_AI_SEARCH_INDEX_NAME,service_name=AZURE_AI_SEARCH_SERVICE_NAME, api_key=AZURE_AI_SEARCH_API_KEY)
-
-#Initialising the vector store using langchain
-
-vector_store= AzureSearch(
-    azure_search_endpoint=AZURE_AI_SEARCH_ENDPOINT,
-    azure_search_key=AZURE_AI_SEARCH_API_KEY,
-    index_name=AZURE_AI_SEARCH_INDEX_NAME,
-    embedding_function=embeddings.embed_query,
-)
-# Function to generate comparison report
-def generate_comparison_report():
-    documents = search_client.search(search_text='*')
-    company_reports = [doc for doc in documents if doc["document_type"] == "Company Report"]
-    news_articles = [doc for doc in documents if doc["document_type"] == "News Article"]
-    
-    company_report_content = " ".join([doc["content"] for doc in company_reports])
-    news_article_content = " ".join([doc["content"] for doc in news_articles])
-    messages=[
-    {"role": "system", "content": f"""You are a sustainability analyst.Compare the company's sustainability claims
-                                   regarding achieving various sustainability goals in the following company report: 
-                                   {company_report_content} with the actual actions reported in the following news 
-                                   articles: {news_article_content}. Provide a detailed analysis and discuss the key 
-                                   points to be noted regarding their sustainability progress. Use only the data provided
-                                   to you in this message"""},
-    {"role": "user", "content": "Hello!"}
-    ]
-    
-    
-    response = openai.chat.completions.create(model="gpt-4o",messages=messages, max_tokens=1024)
-    
-    return response.choices[0].message.content
-
-#Functions for Chat with Sustainability Report Action
-def get_conversational_chain():
-
-    prompt_template = """
-    You are a sustainability analyst with great expertise.Answer the question as detailed as possible from the provided context, make sure to provide all the details, if the answer is not in
-    provided context just say, "Sorry,this information is not available in the context", don't provide the wrong answer\n\n
-    Context:\n {context}?\n
-    Question: \n{question}\n
-
-    Answer:
-    """
-
-    prompt = PromptTemplate(template = prompt_template, input_variables = ["context", "question"])
-    chain = load_qa_chain(llm=llm, chain_type="stuff", prompt=prompt)
-
-    return chain
-
-def user_input(user_question):
-
-    docs = vector_store.similarity_search(user_question)
-    chain = get_conversational_chain()
-    response = chain({"input_documents":docs, "question": user_question},return_only_outputs=True)
-    return response["output_text"]
-
-def sentiment_analysis_and_word_cloud(company):
-
-    filter_query =f"company_name eq '{company}' and document_type eq 'NEWS MEDIA'"
-    news_documents = search_client.search(filter=filter_query,select=["content"])
-     # Populate the DataFrame with sentiment analysis
-    df = pd.DataFrame(columns=["ID", "Published Date","Sentiment"])
-    for index, doc in enumerate(news_documents):
-
-        text=doc["content"] 
-        template = f"Perform sentiment analysis of given text, and assign a positive value for positive tone between (0,1)and negative value between (0,-1)for negative tone: {text}"
-        prompt=PromptTemplate(input_variables=doc,template=template)
-        chain=load_qa_chain(llm=llm,prompt=prompt)
-        sentiment=chain.run(document=doc)
-        df.loc[index] = [index, doc["publish_date"], sentiment]
-        
-    # Visualize sentiment analysis using seaborn
-    sns.set_style("whitegrid")
-    sns.displot(df["Sentiment"], height=5, aspect=1.8)
-    plt.xlabel("Sentiment")
-    plt.title("Sentiment Analysis")
-    st.pyplot()  # Display the plot in Streamlit
-
-    # Generate Wordcloud
-    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(news_documents["content"])
-    plt.figure(figsize=(10, 5))
-    plt.imshow(wordcloud, interpolation='bilinear')
-    plt.axis('off')
-    plt.show()
-    st.pyplot(plt)
-
-
-import streamlit as st
-
-
-# Streamlit app
-icon_path = "logo.jpg"
+#Streamlit Design
+icon_path = "logo.png"
 st.set_page_config(page_title="SUSTAINSCOPE", page_icon=icon_path,
-                       layout='centered', initial_sidebar_state="collapsed")
-_,_, logo,_, _ = st.columns(5)
-logo.image(icon_path, width=60)
+                            layout='centered', initial_sidebar_state="collapsed")
+_,_,logo,_,_ = st.columns(5)
+logo.image(icon_path, width=150)
 style = ("text-align:center; padding: 0px; font-family: arial black;, "
-             "font-size: 250%")
+            "font-size: 250%; color: blue;")
 title = f"<h1 style='{style}'>SUSTAINSCOPE</h1><br><br>"
 st.write(title, unsafe_allow_html=True)
 
 # Disclaimer at the bottom
 st.markdown(
-    """
-    <style>
-    .footer {
-        position: fixed;
-        left: 0;
-        bottom: 0;
-        width: 100%;
-        background-color: #f8f9fa;
-        color: black;
-        text-align: center;
-        padding: 10px;
-        border-top: 0px solid #e9ecef;
-    }
-    </style>
-    <div class="footer">
-        <p style='font-style: italic;'>
-        Disclaimer: This application uses AI-generated content for insights. While we strive for accuracy, please verify findings with primary sources.
-        </p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
+            """
+            <style>
+            .footer {
+                position: fixed;
+                left: 0;
+                bottom: 0;
+                width: 100%;
+                background-color: #f8f9fa;
+                color: black;
+                text-align: center;
+                padding: 10px;
+                border-top: 0px solid #e9ecef;
+            }
+            </style>
+            <div class="footer">
+                <p style='font-style: italic;'>
+                Disclaimer: This application uses AI-generated content for insights. While we strive for accuracy, please verify findings with primary sources.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True
+        )
 
 # Centered selection boxes
 company = st.selectbox("Select the Company for Analysis", ["Choose an option","RIO TINTO", "BHP"], key='company')
 year = st.selectbox("Select Financial Year", ["Choose an option","2023", "2022"], key='year')
+action=st.selectbox("Choose the feature options", ["Choose an option","Generate Sustainability Progress", "Chat with Sustainability Documents","View Public perception"], key='action')
 
-#Initialising session_state
-if 'clicked' not in st.session_state:
-    st.session_state.clicked = False
+
+
+
+
+def user_input(user_query,filter):
+
+    company_report_docs=retrieve_docs_similarity(user_query,filter)
+    company_report_content = " ".join([doc["content"] for doc in company_report_docs])
+    prompt_template = """
+                        You are a sustainability analyst with great expertise.Answer the question {user_query}from the 
+                        provided context{company_report_content} only, make sure to provide all the details,
+                        don't provide the wrong answer.Answer to the point\n\n
+                    
+                    """
+    prompt = ChatPromptTemplate.from_template(prompt_template)
+    messages=prompt.format_messages(company_report_content=company_report_content,user_query=user_query)
+    chat_response=model_chat.invoke(messages)
+    st.write("Reply: ", chat_response.content)
+
+@st.cache_data
+def print_sentiment_and_wordcloud(news_summary_list):
+    # Extract summaries and sentiment 
+
+    summaries = [item['summary'] for item in news_summary_list]
+    sentiment = " ".join([item['sentiment analysis'] for item in news_summary_list])
+
+    # Plot sentiment scores
+    st.write("Sentiment Analysis of News :\n",sentiment)
+
+    # Generate word cloud
+    text = ' '.join(summaries)
+    wordcloud = WordCloud(width=800, height=400, background_color='white').generate(text)
+
+    # Plot word cloud
+    plt.figure(figsize=(10, 6))
+    plt.imshow(wordcloud, interpolation='bilinear')
+    plt.axis('off')
+    st.pyplot(plt) 
+    plt.close()   
+
+@st.cache_data
+#Function to generate news summaries, obtain ESG label and perform sentiment analysis on news articles
+def generate_news_summary():
+    
+    search_client = SearchClient(AZURE_AI_SEARCH_ENDPOINT, AZURE_AI_SEARCH_INDEX_NAME, AzureKeyCredential(AZURE_AI_SEARCH_API_KEY))
+
+    results = search_client.search(
+            search_text="",
+            select=["content"],
+            filter=f"document_type eq 'NEWS MEDIA'"
+    )
+
+    #Defining the context for LLM to analyse the news articles
+    context='''Environmental, social, and governance (ESG) assesses business practices on sustainability and ethics.
+            It measures risks and opportunities related to:
+            - Environmental: Emissions (GHG, pollution), resource use (virgin vs. recycled materials, cradle-to-grave cycling), water stewardship, land use (deforestation, biodiversity).
+            - Social: Employee development, labor practices, product safety, supply chain standards, access for underprivileged groups.
+            - Governance: Shareholder rights, board diversity, executive compensation alignment with sustainability, corporate behavior (anti-competitive practices, corruption).
+
+            '''  
+
+    SummaryResponseSchema=ResponseSchema(name="summary", description="Summarise key ponts given in text from the point of view of sustainability")
+    SentimentResponseSchema=ResponseSchema(name="sentiment analysis",description="Discuss the sentiment of the article with reasoning.")
+    PillarResponseSchema=ResponseSchema(name="pillar",description="Assign Environmental,Social or Governance")             
+        
+    response_schemas=[SummaryResponseSchema,SentimentResponseSchema,PillarResponseSchema]
+    output_parser = StructuredOutputParser.from_response_schemas(response_schemas)
+    format_instructions = output_parser.get_format_instructions()
+
+
+    news_summary_list=[]
+    #Accessing the news aricles one by one
+    for result in results:
+        
+        
+        article=result["content"]
+        # Define the prompt templates
+        prompt_template = """
+                            You are a sustainability analyst with expert knowledge of the following context: {context}.Analyze the following news article: {article}.
+                            summary:Generate a summary mentioning all the key points related to the company's sustainability efforts.
+                            pillar:Specify sustainability pillar one of(Environmental, Social, or Governance) 
+                            sentiment_analysis:Discuss the sentiment of the article with reasoning.
+                            Do not include any content that is not present or derived from the article. Do not include any comments
+                            Always put a delimiter ',' between the three key-value pairs
+                            Format the response according to the following instructions: 
+                            {format_instructions}
+                        """         
+
+        articles_prompt = ChatPromptTemplate.from_template(prompt_template)
+        messages=articles_prompt.format_messages(context=context,article=article ,format_instructions=format_instructions)
+        # Create the chains using runnables
+        response_final=model.invoke(messages)
+        response_final_dict=output_parser.parse(response_final.content)
+        response_final_dict["sentiment_score"]=TextBlob(article).sentiment.polarity
+        news_summary_list.append(response_final_dict)
+
+        # Filter and write summaries for each pillar
+        for pillar in ["Environmental", "Social", "Governance"]:
+            # Extract summaries for the current pillar
+            summaries = [news["summary"] for news in news_summary_list if news["pillar"] == pillar]
+            # Write these summaries to a file
+            write_summaries_to_file(pillar, summaries)
+        return news_summary_list
+
+
+@st.cache_data
+def generate_section_reports(company,year,pillar):
+
+    # Reading summaries for given pillar and storing them in variables
+    summaries = read_summaries_from_file(pillar)
+    
+    #Generate queries corresponding to points in the news media
+    queries=generate_insights(summaries)
+    
+
+    
+    filter=f"company_name eq '{company}' and document_type eq 'COMPANY REPORTS' and financial_year eq '{year}'"
+    company_report_data_list=[]
+    query_list=[]
+    for query in queries:
+        query_list.append(query)
+        company_report_docs=retrieve_docs_similarity(query,filter)
+        company_report_data_list.extend(company_report_docs) #Flattening the list
+    company_report_content = " ".join([doc["content"] for doc in company_report_data_list])
+
+
+    context='''Environmental, social, and governance (ESG) assesses business practices on sustainability and ethics.
+            It measures risks and opportunities related to:
+            - Environmental: Emissions (GHG, pollution), resource use (virgin vs. recycled materials, cradle-to-grave cycling), water stewardship, land use (deforestation, biodiversity).
+            - Social: Employee development, labor practices, product safety, supply chain standards, access for underprivileged groups.
+            - Governance: Shareholder rights, board diversity, executive compensation alignment with sustainability, corporate behavior (anti-competitive practices, corruption).
+
+            '''  
+
+    # Define the prompt template
+    prompt_template = """
+                        You are a sustainability analyst with expert knowledge of the following context: {context}.
+                        You are investigating if a company is actually working towards its sustainability targets and goals.
+                        Task:
+                        1)Review the following news summaries: {summaries} and the queries {queries}that arise from them. 
+                        Critically verify if the news data which represents the company's sustainability
+                        efforts published in the media aligns with the targets and goals claimed by the company in its reports.
+                        2)Analyse the information {company_report_content}retrieved from the company reports.Use this information 
+                        to answer the queries arising from the news summaries. 
+                        
+                        Report Structure:
+                        Generate a section of the report having the following schema:
+
+                        1)**News Media Observations**:- Mention all the relevant key points from the {summaries} in bulleted points.
+                                                     - Highlight the points you want to compare with the sustainability company report data.
+
+                        2)**Company Report Data**:- Compare the key points mentioned in the News Media Observations with the claims,
+                                                    targets,goals,objectives, key performance indicators retrieved from {company_report_content}.
+
+                        3)**Actions & Insights**: - Based on the above two sections, use your skills as a sustainability analyst to critically reason and provide actions and insights.
+                                                  - Offer recommendations for the company to improve their efforts towards the {pillar} sustainability pillar.
+                                                  - Ensure the actions and insights are valuable to investors, NGOs, sustainability teams, and public policy makers.
+
+                        4)**Sentiment Analysis**:- Discuss the public perception of {company}'s {pillar} sustainability pillar based on sentiment analysis of the news summaries.
+                                                - Provide detailed reasoning for your analysis.
+
+                        Important Notes:
+                        - All content generated should be based only on the {context}, {summaries}, and {company_report_content}.
+                        - Ensure that you generate content for all four schema headers (News Media Observations, Company Report Data, Actions & Insights, Sentiment Analysis).
+                        - Exclude any information not related to {company}'s sustainability efforts.
+                        -generated content should include info only corresponding to the sustainability pillar{pillar}
+
+                        
+                    """         
+
+    section_generator_prompt = ChatPromptTemplate.from_template(prompt_template)
+    messages=section_generator_prompt.format_messages(context=context,summaries=summaries,company_report_content=company_report_content,queries=queries ,pillar=pillar,company=company)
+    # Create the chains using runnables
+    section_response_final=model.invoke(messages)
+
+    return section_response_final.content
+
+# Streamlit app
+
+
+news_summary_list=generate_news_summary()
+
 def click_button():
-    st.session_state.clicked = True
+    if company != "Choose an option" and year != "Choose an option" and action == "Generate Sustainability Progress":
+        
+        report_section_env=generate_section_reports(company=company,year=year,pillar="Environmental")
+        report_section_soc=generate_section_reports(company=company,year=year,pillar="Social")
+        report_section_gov=generate_section_reports(company=company,year=year,pillar="Governance")  
+        st.markdown("""
+                <style>
+                    .report-container {
+                        border: 2px solid #e0e0e0;
+                        padding: 20px;
+                        border-radius: 10px;
+                        margin-bottom: 20px;
+                    }
+                    .report-header {
+                        font-size: 24px;
+                        font-weight: bold;
+                        text-align: center;
+                        margin-bottom: 20px;
+                    }
+                    .report-subheader {
+                        font-size: 20px;
+                        font-weight: bold;
+                        color: #4CAF50;
+                        margin-top: 20px;
+                        margin-bottom: 10px;
+                    }
+                    .report-content {
+                        font-size: 16px;
+                        line-height: 1.6;
+                    }
+                </style>
+                """, unsafe_allow_html=True)
 
-#Select Feature to view the news media sentiment analysis and word cloud
-st.button('NEWS MEDIA SENTIMENT ANALYSIS AND WORD CLOUD', on_click=click_button)
+        st.markdown(f"<div class='report-header'>SUSTAINABILITY PROGRESS REPORT</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-container'><strong>COMPANY:</strong> {company}</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-container'><strong>Financial Year:</strong> {year}</div>", unsafe_allow_html=True)
 
-if st.session_state.clicked:
-    sentiment_analysis_and_word_cloud(company)
+        st.markdown("<div class='report-subheader'>Environmental Sustainability</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-container report-content'>{report_section_env}</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='report-subheader'>Social Sustainability</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-container report-content'>{report_section_soc}</div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='report-subheader'>Governance Sustainability</div>", unsafe_allow_html=True)
+        st.markdown(f"<div class='report-container report-content'>{report_section_gov}</div>", unsafe_allow_html=True)    
+
+    elif company != "Choose an option" and year != "Choose an option" and action == "Chat with Sustainability Documents":
+        user_query = st.text_input("Ask a Question about company's sustainability reports")
+        if user_query:
+            filter=f"company_name eq '{company}' and document_type eq 'COMPANY REPORTS' and financial_year eq '{year}'"
+            user_input(user_query,filter)
+
+    elif company != "Choose an option" and year != "Choose an option" and action == "View Public perception":
+        print_sentiment_and_wordcloud(news_summary_list)
+
+    
+        
+
+click_button()
+
+
+
+
+
+        
     
 
 
 
-#Select Feature to chat with sustainability report
-st.button('CHAT WITH SUSTAINABILITY REPORT', on_click=click_button)
 
-if st.session_state.clicked:
-    # The message and nested widget will remain on the page
-    user_question = st.text_input("Ask a Question from the PDF Files")
-    if user_question:
-        response=user_input(user_question)
-        st.write("Reply: ", response)
-
-#Select Feature to Analyse Sustainability Progress
-st.button('ANALYSE SUSTAINABILITY PROGRESS', on_click=click_button)
-
-if st.session_state.clicked:
-    # The message and nested widget will remain on the page
-    report=generate_comparison_report()
-    st.write(report)
-    
-    
